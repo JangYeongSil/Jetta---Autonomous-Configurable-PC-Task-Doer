@@ -1,0 +1,260 @@
+#importurile necesare , MongoClient e baza de date necesara pentru memorie .
+import configparser
+import openai
+import cv2
+import sys
+import time
+import pyautogui
+import json
+import textwrap
+import logging
+import numpy as np
+from collections import defaultdict
+from pymongo import MongoClient
+from PIL import Image
+# OpenAI API
+config = configparser.ConfigParser()
+config.read('project/config.ini')
+API_KEY = config['DEFAULT']['API_KEY']
+openai.api_key = API_KEY
+# Urmeaza folosirea MongoClient db_name si collection_name sunt numele folderelor ce vor fi create in MongoDB Compass
+class LongTermMemory:
+    def __init__(self, db_name="memory_db", collection_name="memory"):
+        self.client = MongoClient()
+        self.db = self.client[db_name]
+        self.collection = self.db[collection_name]
+
+    def add(self, item):
+        self.collection.insert_one({"item": item})
+
+
+
+    def recall(self, prompt):
+        items = self.storage.list_items()
+        relevant_items = [json.loads(item["item"]) for item in items if
+                          item is not None and prompt.lower() in item["item"].lower()]
+        return relevant_items
+
+class GoalManager:
+    def __init__(self):
+        self.goals = defaultdict(list)
+
+    def add_goal(self, goal, priority="medium"):
+        self.goals[priority].append(goal)
+
+    def get_goals(self, priority=None):
+        if priority:
+            return self.goals[priority]
+        return self.goals
+
+    def remove_goal(self, goal, priority=None):
+        if priority:
+            self.goals[priority].remove(goal)
+        else:
+            for p in self.goals.keys():
+                if goal in self.goals[p]:
+                    self.goals[p].remove(goal)
+                    break
+
+def perform_ner(text):
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": f"Perform Named Entity Recognition (NER) on the following text: \"{text}\". The recognized entities are:"}
+        ],
+        max_tokens=50,
+        n=1,
+        stop=None,
+        temperature=0.5,
+    )
+    # Sleep for 20 seconds before generating the next response
+    time.sleep(80)
+    return response.choices[0].message["content"].strip()
+
+def analyze_sentiment(text):
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user",
+             "content": f"Please analyze the sentiment of the following text: \"{text}\". Sentiment:"}
+        ],
+        max_tokens=50,
+        n=1,
+        stop=None,
+        temperature=0.5,
+    )
+    sentiment = response.choices[0].message["content"].strip()
+    return sentiment
+
+def generate_response(prompt, conversation_history, long_term_memory, goal_manager, max_context_length=8):
+    recent_history_length = min(len(conversation_history), max_context_length)
+    recent_history = conversation_history[-recent_history_length:]
+
+    # Perform sentiment analysis
+    sentiment = analyze_sentiment(prompt)
+    print(f"Sentiment: {sentiment}")
+
+    # Perform NER
+    entities = perform_ner(prompt)
+    print(f"Entities: {entities}")
+
+    messages = [{"role": "system", "content": "You are an advanced intelligent autonomous thinking machine. Your name is Jetta."}]
+    messages.extend(recent_history)
+    messages.extend(long_term_memory.recall(prompt))
+    messages.append({"role": "user", "content": prompt})
+    goals = goal_manager.get_goals()
+    if goals:
+        messages.append({"role": "assistant", "content": f"As Jetta, my current goals are: {', '.join([goal for priority in goals.values() for goal in priority])}"})
+
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=messages,
+        max_tokens=300,
+        n=1,
+        stop=None,
+        temperature=0.99,
+    )
+    template_path = "template.png"
+
+    # define the `simulate_mouse_movement` function to move the mouse cursor to the given (x, y) location on screen
+    def simulate_mouse_movement(x, y):
+        pyautogui.moveTo(x, y)
+
+    def find_image_on_screen(template_path):
+        try:
+            # Load the template image
+            template = cv2.imread(template_path, cv2.IMREAD_UNCHANGED)
+
+            # Convert the template image to grayscale and normalize its data type
+            template = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+            template = cv2.convertScaleAbs(template)
+
+            # Resize the template image to a smaller size
+            template = cv2.resize(template, (51, 34))
+
+            # Capture a screenshot of the entire screen
+            screenshot = pyautogui.screenshot()
+
+            # Convert the screenshot to a numpy array and then to grayscale
+            screen = np.array(screenshot)
+            screen = cv2.cvtColor(screen, cv2.COLOR_RGB2GRAY)
+
+            # Ensure data types are compatible before using matchTemplate()
+            template = template.astype(np.float32)
+            screen = screen.astype(np.float32)
+
+            # Find the location of the template image in the screenshot using matchTemplate()
+            result = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
+            _, _, _, max_loc = cv2.minMaxLoc(result)
+
+            # Return the center coordinates of the template image on the screen
+            threshold = 0.8
+            if np.amax(result) >= threshold:
+                x, y = max_loc[0] + template.shape[1] // 2, max_loc[1] + template.shape[0] // 2
+                return x, y
+            else:
+                return None
+        except Exception as e:
+            # Log the error message and re-raise the exception
+            logging.error(f"Error occurred: {e}")
+            raise e
+
+
+    # Check if a specific command is given.
+    if "click on the button" in prompt.lower():
+        # Search for the button image on the screen
+        button_template_path = "template.png"
+        button_location = find_image_on_screen(button_template_path)
+
+        # Click the button if found
+        if button_location is not None:
+            print(f"Found button at {button_location[0]}, {button_location[1]}")
+            simulate_mouse_movement(button_location[0], button_location[1])
+            pyautogui.click()
+            # Append the action performed to the conversation history
+            conversation_history.append({"role": "assistant", "content": "Clicked on the button."})
+        else:
+            print("Button not found on screen.")
+            # Append the action performed to the conversation history
+            conversation_history.append({"role": "assistant", "content": "Could not find the button on screen."})
+    else:
+        # Return the generated response
+        return response.choices[0].message["content"]
+
+def is_repeated_response(response, conversation_history):
+    previous_responses = [message["content"] for message in conversation_history if message["role"] == "assistant"]
+    return response in previous_responses
+def task_completed(response):
+    if response is None:
+        return False
+    return "problem solved" in response.lower() or "solution" in response.lower()
+def thinking_animation():
+    print("Thinking", end='')
+    for _ in range(3):
+        sys.stdout.write('.')
+        sys.stdout.flush()
+        time.sleep(0.5)
+    print()
+
+def save_conversation_history(conversation_history, filename="conversation_history.json"):
+    with open(filename, "w") as outfile:
+        json.dump(conversation_history, outfile, indent=2)
+
+def wrap_text(text, width=80):
+    if text is None:
+        return ""
+    return "\n".join(textwrap.wrap(text, width))
+
+
+def autonomous_agent_v9(initial_prompt, max_iterations=20):
+    conversation_history = [{"role": "user", "content": initial_prompt}]
+    memory = []
+    long_term_memory = LongTermMemory()
+    goal_manager = GoalManager()
+
+    # Add example goals
+    goal_manager.add_goal("Understand the user's problem")
+    goal_manager.add_goal("Provide helpful suggestions", priority="high")
+    goal_manager.add_goal("Ask clarifying questions if needed, only if needed")
+
+    iterations = 0
+    while True:
+        iterations += 1
+
+        # Generate response
+        current_prompt = conversation_history[-1]["content"]
+        print(f"Input: {wrap_text(current_prompt)}")
+        response = generate_response(current_prompt, conversation_history, long_term_memory, goal_manager)
+        thinking_animation()
+
+        # Sleep for 20 seconds before generating the next response
+        time.sleep(80)
+
+        # Check for repetition and try to generate a new response if needed
+        retries = 0
+        while is_repeated_response(response, conversation_history) and retries < 3:
+            response = generate_response(current_prompt, conversation_history, long_term_memory, goal_manager)
+            retries += 1
+
+        print(f"Output: {wrap_text(response)}")
+        conversation_history.append({"role": "assistant", "content": response})
+        memory.append(response)
+        long_term_memory.add(json.dumps({"role": "assistant", "content": response}))
+
+        if task_completed(response):
+            break
+
+        if iterations >= max_iterations:
+            break
+
+    save_conversation_history(conversation_history)
+
+
+if __name__ == "__main__":
+    while True:
+        initial_prompt = input("\nEnter the initial prompt or type 'exit' to quit: ")
+        if initial_prompt.lower() == "exit":
+            break
+        autonomous_agent_v9(initial_prompt)
